@@ -3,8 +3,10 @@
 // - Accepts only the pinned extension Origin, so web pages cannot reach Claude.
 // - One extension connection at a time. A new one replaces the old one.
 // - If the port is busy (another Claude session owns it), retries until it frees.
+// - Takeover: when a tool runs in a waiting session, it asks the owner to hand
+//   over (POST /handover). The owner lets go and waits. The session you use wins.
 
-import { createServer, type IncomingMessage, type Server as HttpServer } from 'node:http'
+import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse, type Server as HttpServer } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { WebSocketServer, type WebSocket } from 'ws'
 import type {
@@ -31,9 +33,11 @@ export type BridgeOptions = {
   host?: string
   requestTimeoutMs?: number
   retryMs?: number
+  /** After a takeover, how long to wait for the extension to reconnect. */
+  connectWaitMs?: number
+  /** After handing over, how long to wait before trying the port again. */
+  yieldMs?: number
   log?: (msg: string) => void
-  /** The user clicked "Tell Claude" in the browser. */
-  onTellClaude?: (count: number) => void
   /** An extension connected (or reconnected). */
   onConnected?: () => void
 }
@@ -48,11 +52,16 @@ type Method = ServerRequest['method']
 
 const MAX_PAYLOAD = 1024 * 1024
 
+/** Sent on /handover. A custom header makes a browser send a CORS preflight first, which we never allow. */
+const HANDOVER_HEADER = 'x-ui-annotate'
+const LOCAL_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
 export class Bridge {
   state: 'starting' | 'listening' | 'port_busy' | 'closed' = 'starting'
 
-  private readonly opts: Required<Omit<BridgeOptions, 'onTellClaude' | 'onConnected'>> &
-    Pick<BridgeOptions, 'onTellClaude' | 'onConnected'>
+  private readonly opts: Required<Omit<BridgeOptions, 'onConnected'>> & Pick<BridgeOptions, 'onConnected'>
   private readonly http: HttpServer
   private readonly wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD })
   private socket: WebSocket | null = null
@@ -60,6 +69,7 @@ export class Bridge {
   private nextId = 1
   private retryTimer: NodeJS.Timeout | null = null
   private warnedBusy = false
+  private takingOver = false
 
   constructor(options: BridgeOptions) {
     // `??` per field: callers pass `undefined` for "use the default", and a
@@ -69,9 +79,14 @@ export class Bridge {
       host: options.host ?? '127.0.0.1',
       requestTimeoutMs: options.requestTimeoutMs ?? 5000,
       retryMs: options.retryMs ?? 2000,
+      connectWaitMs: options.connectWaitMs ?? 8000,
+      yieldMs: options.yieldMs ?? 5000,
       log: options.log ?? (() => {}),
     }
-    this.http = createServer((_req, res) => res.writeHead(426).end('WebSocket only\n'))
+    this.http = createServer((req, res) => {
+      if (req.method === 'POST' && req.url === '/handover') this.handleHandover(req, res)
+      else res.writeHead(426).end('WebSocket only\n')
+    })
     this.http.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head))
     this.http.on('listening', () => {
       this.state = 'listening'
@@ -86,7 +101,8 @@ export class Bridge {
       this.state = 'port_busy'
       if (!this.warnedBusy) this.opts.log(`port ${this.opts.port} busy, retrying every ${this.opts.retryMs} ms`)
       this.warnedBusy = true
-      this.retryTimer = setTimeout(() => this.listen(), this.opts.retryMs)
+      // During a takeover the old owner is letting go right now: retry fast.
+      this.retryTimer = setTimeout(() => this.listen(), this.takingOver ? 50 : this.opts.retryMs)
     })
   }
 
@@ -112,6 +128,24 @@ export class Bridge {
     this.socket = null
     this.wss.close()
     await new Promise<void>((resolve) => (this.http.listening ? this.http.close(() => resolve()) : resolve()))
+  }
+
+  /**
+   * Make sure this session holds the link before a tool call. If another
+   * session owns the port, take it over and wait for the extension to reconnect.
+   */
+  async ready(): Promise<{ tookOver: boolean }> {
+    if (this.state !== 'port_busy') return { tookOver: false }
+    if (!(await this.takeOver())) {
+      throw new BridgeError(
+        'port_busy',
+        `Another program holds port ${this.opts.port} and did not hand it over. ` +
+          'If it is an older Claude session, close it or use it instead.',
+      )
+    }
+    const end = Date.now() + this.opts.connectWaitMs
+    while (!this.connected && Date.now() < end) await sleep(50)
+    return { tookOver: true }
   }
 
   request(method: 'get_pending_edits'): Promise<RequestResult['get_pending_edits']>
@@ -148,8 +182,58 @@ export class Bridge {
   }
 
   private listen(): void {
-    if (this.state === 'closed') return
+    if (this.state === 'closed' || this.http.listening) return
     this.http.listen(this.opts.port, this.opts.host)
+  }
+
+  /** Ask the owner to hand over, then bind the port. True when this session now holds it. */
+  private async takeOver(): Promise<boolean> {
+    const accepted = await new Promise<boolean>((resolve) => {
+      const req = httpRequest(
+        { host: this.opts.host, port: this.opts.port, path: '/handover', method: 'POST', headers: { [HANDOVER_HEADER]: 'handover' }, timeout: 2000 },
+        (res) => {
+          res.resume()
+          resolve(res.statusCode === 200)
+        },
+      )
+      req.on('timeout', () => req.destroy())
+      req.on('error', () => resolve(false))
+      req.end()
+    })
+    if (!accepted) return false
+
+    this.opts.log('took over the browser link from another session')
+    this.takingOver = true
+    if (this.retryTimer) clearTimeout(this.retryTimer)
+    this.listen()
+    const end = Date.now() + 3000
+    while (this.state !== 'listening' && Date.now() < end) await sleep(25)
+    this.takingOver = false
+    return this.state === 'listening'
+  }
+
+  /** Another session asks for the link. Only a local, non-browser caller may ask. */
+  private handleHandover(req: IncomingMessage, res: ServerResponse): void {
+    const local = LOCAL_ADDRESSES.has(req.socket.remoteAddress ?? '')
+    if (!local || req.headers.origin || req.headers[HANDOVER_HEADER] !== 'handover') {
+      res.writeHead(403).end()
+      return
+    }
+    res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}', () => this.yieldPort())
+  }
+
+  /** Let go of the port and the extension, then wait. Do not grab the port back right away. */
+  private yieldPort(): void {
+    this.opts.log('handed the browser link to another session')
+    this.rejectAll(new BridgeError('not_connected', 'Another Claude session took over the browser link.'))
+    this.socket?.terminate()
+    this.socket = null
+    this.http.close()
+    this.http.closeAllConnections()
+    this.state = 'port_busy'
+    this.warnedBusy = true
+    if (this.retryTimer) clearTimeout(this.retryTimer)
+    this.retryTimer = setTimeout(() => this.listen(), this.opts.yieldMs)
   }
 
   private handleUpgrade(req: IncomingMessage, sock: Duplex, head: Buffer): void {
@@ -192,9 +276,6 @@ export class Bridge {
     switch (msg.type) {
       case 'ping':
         this.send(ws, { type: 'pong' })
-        return
-      case 'tell_claude':
-        this.opts.onTellClaude?.(Number(msg.count) || 0)
         return
       case 'reply': {
         const p = this.pending.get(msg.id)

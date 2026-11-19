@@ -4,7 +4,7 @@ import { EXTENSION_PUBLIC_KEY } from '@ui-annotate/shared'
 export default defineConfig({
   manifest: {
     name: 'UI Annotate for Claude',
-    description: 'Option+click text on your local app, edit it or add a note, and send the queue to Claude Code.',
+    description: 'Option+click text on your local app, edit it or add a note, and queue it for Claude Code to pull.',
     // Pins the extension ID. The MCP server only accepts this ID's origin.
     key: EXTENSION_PUBLIC_KEY,
     permissions: ['storage', 'alarms'],
@@ -14,10 +14,6 @@ export default defineConfig({
       'toggle-pick': {
         suggested_key: { default: 'Alt+Shift+E' },
         description: 'Turn edit mode on or off',
-      },
-      'tell-claude': {
-        suggested_key: { default: 'Alt+Shift+T' },
-        description: 'Tell Claude the queued edits are ready',
       },
     },
   },

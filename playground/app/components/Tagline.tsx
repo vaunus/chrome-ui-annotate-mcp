@@ -9,5 +9,9 @@ export function Tagline() {
       .then((r) => r.json())
       .then((d) => setText(d.tagline));
   }, []);
-  return <p className="text-sm text-zinc-500">{text}</p>;
+  return (
+    <p className="w-fit rounded-full border-2 border-purple-300 bg-purple-600 px-4 py-1.5 text-sm font-semibold text-white shadow-lg shadow-purple-500/30 empty:hidden">
+      {text}
+    </p>
+  );
 }

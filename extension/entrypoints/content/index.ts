@@ -15,7 +15,9 @@ import {
   nearbyText,
   pickTarget,
   selectorFor,
+  soleTextNode,
   trimmedHtml,
+  widen,
   tagName,
   type Pick,
 } from '../../lib/pick.ts'
@@ -33,7 +35,6 @@ export default defineContentScript({
 
 const HOST_TAG = 'ui-annotate-root'
 const WAKE_MS = 20_000
-const NOTICE_MS = 10_000
 const RELOCATE_MS = 1000
 const POPUP_W = 340
 const MARGIN = 12
@@ -49,6 +50,8 @@ const STATUS_TEXT: Record<UiEdit['status'], string> = {
 const isMac = /Mac|iPhone|iPad/.test(navigator.platform)
 const OPTION = isMac ? '⌥ Option' : 'Alt'
 const EXIT_KEYS = isMac ? '⌥⇧E' : 'Alt+Shift+E'
+/** The `apply` MCP prompt, as Claude Code lists it in the `/` menu. */
+const APPLY_CMD = '/ui-annotate:apply'
 
 async function send(req: BgRequest): Promise<unknown> {
   const res = (await browser.runtime.sendMessage(req)) as BgResponse | undefined
@@ -104,7 +107,6 @@ async function start(ctx: ContentScriptContext): Promise<void> {
     queue: (got[KEYS.queue] as UiEdit[] | undefined) ?? [],
     pickMode: !!got[KEYS.pickMode],
     link: (got[KEYS.link] as StoredState['link'] | undefined) ?? { connected: false },
-    lastTell: got[KEYS.lastTell] as StoredState['lastTell'],
     collapsed: !!got[KEYS.collapsed],
   }
 
@@ -133,6 +135,8 @@ async function start(ctx: ContentScriptContext): Promise<void> {
   // ---- hover and selection ---------------------------------------------------
 
   let hover: Pick | null = null
+  /** stack[0] is the block under the cursor. Each ↑ pushes a wider parent; ↓ pops. */
+  let stack: Pick[] = []
   let lastTarget: Element | null = null
   let popupFor: Element | null = null
 
@@ -140,6 +144,52 @@ async function start(ctx: ContentScriptContext): Promise<void> {
     if (pick?.el === hover?.el) return
     hover = pick
     if (pick) hoverLabel.textContent = label(tagName(pick.el), probeReact(pick.el)?.component) + (pick.hasText ? '' : ' · note')
+  }
+
+  /** Outline the block under the cursor. Keeps a widened pick while the cursor stays on the same block. */
+  function hoverAt(target: Element): void {
+    const base = pickTarget(target)
+    if (stack[0]?.el !== base.el) stack = [base]
+    setHover(stack.at(-1)!)
+  }
+
+  function clearHover(): void {
+    stack = []
+    setHover(null)
+  }
+
+  // ---- live preview ----------------------------------------------------------
+
+  /** Previews kept on the page after queueing: edit id → its text node and the original text. */
+  const previews = new Map<string, { node: Text; original: string }>()
+
+  /** Run `fn` with every preview put back to the original, so captured context matches the code. */
+  function withOriginals<T>(fn: () => T): T {
+    const shown: Array<[Text, string]> = []
+    for (const p of previews.values()) {
+      if (p.node.isConnected && p.node.data !== p.original) {
+        shown.push([p.node, p.node.data])
+        p.node.data = p.original
+      }
+    }
+    try {
+      return fn()
+    } finally {
+      for (const [node, data] of shown) node.data = data
+    }
+  }
+
+  /** Undo previews whose item is gone or failed. Stop tracking done ones: the code has the text now. */
+  function syncPreviews(): void {
+    for (const [id, p] of previews) {
+      const edit = state.queue.find((e) => e.id === id)
+      if (edit?.status === 'done') {
+        previews.delete(id)
+      } else if (!edit || edit.status === 'failed') {
+        if (p.node.isConnected) p.node.data = p.original
+        previews.delete(id)
+      }
+    }
   }
 
   function placeBox(box: HTMLElement, el: Element | null, labelEl?: HTMLElement): void {
@@ -223,7 +273,12 @@ async function start(ctx: ContentScriptContext): Promise<void> {
 
   // ---- popup -----------------------------------------------------------------
 
+  /** Undoes an unsaved live preview. Set by showPopup. */
+  let popupCleanup: (() => void) | null = null
+
   function closePopup(): void {
+    popupCleanup?.()
+    popupCleanup = null
     popupEl?.remove()
     popupEl = null
     popupFor = null
@@ -234,6 +289,20 @@ async function start(ctx: ContentScriptContext): Promise<void> {
     popupFor = o.el
     const hasText = o.oldText !== undefined
     const textArea = hasText ? h('textarea', { rows: 2, value: o.newText ?? o.oldText }) : null
+
+    // Live preview: only for a plain text node, which React keeps and updates in place.
+    const node = textArea && o.el ? soleTextNode(o.el) : null
+    const shownAtOpen = node?.data ?? ''
+    const original = [...previews.values()].find((p) => p.node === node)?.original ?? shownAtOpen
+    let saved = false
+    if (node && textArea) {
+      textArea.addEventListener('input', () => {
+        node.data = textArea.value.trim() ? textArea.value : shownAtOpen
+      })
+    }
+    popupCleanup = () => {
+      if (node && !saved && node.isConnected) node.data = shownAtOpen
+    }
     const noteArea = h('textarea', {
       rows: 2,
       value: o.note,
@@ -253,11 +322,20 @@ async function start(ctx: ContentScriptContext): Promise<void> {
       }
       submitBtn.disabled = true
       try {
-        await o.onSubmit(changed ? 'copy' : 'note', {
+        const edit = (await o.onSubmit(changed ? 'copy' : 'note', {
           kind: changed ? 'copy' : 'note',
           ...(changed ? { newText: text } : {}),
           note: note || undefined,
-        })
+        })) as UiEdit | null
+        saved = true
+        if (node && changed && text && edit?.id) {
+          node.data = text
+          previews.set(edit.id, { node, original })
+        } else if (node) {
+          // Text unchanged (a note): show the original again and stop previewing.
+          node.data = original
+          if (edit?.id) previews.delete(edit.id)
+        }
         closePopup()
       } catch (err) {
         error.textContent = (err as Error).message
@@ -293,6 +371,7 @@ async function start(ctx: ContentScriptContext): Promise<void> {
       h('div', { class: 'popup-head' }, h('span', { class: 'popup-title' }, o.title), h('span', { class: 'popup-where' }, o.where)),
       o.info ? h('div', { class: 'warn' }, o.info) : null,
       textArea ? h('label', { class: 'field' }, h('span', { class: 'field-label' }, 'Text'), textArea) : null,
+      node ? h('div', { class: 'preview-hint' }, 'The page shows your text as you type.') : null,
       o.warnMarkup ? h('div', { class: 'warn' }, 'This text has links or styling inside. Claude keeps them and changes only the words.') : null,
       h('label', { class: 'field' }, h('span', { class: 'field-label' }, hasText ? 'Note for Claude' : 'What should change?'), noteArea),
       error,
@@ -331,17 +410,22 @@ async function start(ctx: ContentScriptContext): Promise<void> {
   }
 
   function openNewPopup(pick: Pick): void {
+    closePopup() // undo an unsaved preview before reading the page
     const el = pick.el
     const react = probeReact(el)
-    const oldText = pick.hasText ? collapse(el.textContent) : undefined
-    const draft: Draft = {
-      url: location.href,
-      ...(oldText !== undefined ? { oldText } : {}),
-      selector: selectorFor(el),
-      outerHTML: trimmedHtml(el),
-      nearbyText: nearbyText(el),
-      ...(react ? { react } : {}),
-    }
+    // Read the original text, not a preview: Claude searches the code for it.
+    const { oldText, draft } = withOriginals(() => {
+      const oldText = pick.hasText ? collapse(el.textContent) : undefined
+      const draft: Draft = {
+        url: location.href,
+        ...(oldText !== undefined ? { oldText } : {}),
+        selector: selectorFor(el),
+        outerHTML: trimmedHtml(el),
+        nearbyText: nearbyText(el),
+        ...(react ? { react } : {}),
+      }
+      return { oldText, draft }
+    })
     showPopup({
       title: pick.hasText ? 'Edit text' : 'Add a note',
       where: label(tagName(el), react?.component),
@@ -377,8 +461,6 @@ async function start(ctx: ContentScriptContext): Promise<void> {
   }
 
   // ---- panel -----------------------------------------------------------------
-
-  let noticeTimer: ReturnType<typeof setTimeout> | undefined
 
   function itemRow(edit: UiEdit, n: number): HTMLElement {
     const editable = edit.status === 'queued' || edit.status === 'failed' || edit.status === 'needs_input'
@@ -430,19 +512,6 @@ async function start(ctx: ContentScriptContext): Promise<void> {
     return body
   }
 
-  function notice(): HTMLElement | null {
-    const t = state.lastTell
-    if (!t || Date.now() - t.at > NOTICE_MS) return null
-    if (!t.ok) return h('div', { class: 'notice error' }, t.error ?? 'Could not reach Claude.')
-    return h(
-      'div',
-      { class: 'notice' },
-      `Sent ${t.count} edit${t.count === 1 ? '' : 's'} to Claude. If Claude did not start, type `,
-      h('code', {}, '/mcp__ui-annotate__apply'),
-      ' in Claude.',
-    )
-  }
-
   function renderPanel(): void {
     panel.hidden = !state.pickMode
     if (!state.pickMode) return
@@ -465,14 +534,14 @@ async function start(ctx: ContentScriptContext): Promise<void> {
       panel.replaceChildren(head)
       return
     }
-    const tell = h('button', { class: 'btn primary', disabled: queued === 0, onClick: () => void send({ type: 'tell_claude' }) }, `Tell Claude (${queued})`)
+    // Shown only when there is something for Claude to pull.
+    const apply = queued ? h('span', { class: 'apply' }, h('code', {}, APPLY_CMD), ` in Claude to apply ${queued}`) : null
     const clear = done ? h('button', { class: 'link-btn', onClick: () => void send({ type: 'clear_done' }) }, 'Clear done') : null
     panel.replaceChildren(
       head,
       panelBody(),
-      notice() ?? '',
-      h('div', { class: 'panel-foot' }, tell, clear),
-      h('div', { class: 'hint' }, `${OPTION}+click to pick · ${EXIT_KEYS} leaves edit mode`),
+      apply || clear ? h('div', { class: 'panel-foot' }, apply ?? h('span', { class: 'apply' }), clear) : '',
+      h('div', { class: 'hint' }, `${OPTION}+click to pick · ↑ widens · ${EXIT_KEYS} leaves edit mode`),
     )
   }
 
@@ -484,7 +553,7 @@ async function start(ctx: ContentScriptContext): Promise<void> {
       if (!raf) raf = ctx.requestAnimationFrame(frame)
     } else {
       closePopup()
-      setHover(null)
+      clearHover()
       hoverBox.hidden = true
       selectedBox.hidden = true
       for (const m of markers.values()) m.remove()
@@ -501,8 +570,8 @@ async function start(ctx: ContentScriptContext): Promise<void> {
     (e) => {
       if (!state.pickMode) return
       if (e.target instanceof Element) lastTarget = e.target
-      if (!e.altKey || insideUi(e) || !lastTarget) setHover(null)
-      else setHover(pickTarget(lastTarget))
+      if (!e.altKey || insideUi(e) || !lastTarget) clearHover()
+      else hoverAt(lastTarget)
     },
     { capture: true, passive: true },
   )
@@ -510,12 +579,26 @@ async function start(ctx: ContentScriptContext): Promise<void> {
     window,
     'keydown',
     (e) => {
-      if (e.key === 'Alt' && state.pickMode && lastTarget && !insideUi(e)) setHover(pickTarget(lastTarget))
+      if (!state.pickMode || insideUi(e)) return
+      if (e.key === 'Alt' && lastTarget) {
+        hoverAt(lastTarget)
+      } else if (e.altKey && hover && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+        // ↑ widens the pick to the parent, ↓ goes back. No page scroll.
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        if (e.key === 'ArrowUp') {
+          const wider = widen(stack.at(-1)!.el)
+          if (wider) stack.push(wider)
+        } else if (stack.length > 1) {
+          stack.pop()
+        }
+        setHover(stack.at(-1)!)
+      }
     },
     { capture: true },
   )
-  ctx.addEventListener(window, 'keyup', (e) => e.key === 'Alt' && setHover(null), { capture: true })
-  ctx.addEventListener(window, 'blur', () => setHover(null))
+  ctx.addEventListener(window, 'keyup', (e) => e.key === 'Alt' && clearHover(), { capture: true })
+  ctx.addEventListener(window, 'blur', () => clearHover())
 
   // Option+click belongs to us in edit mode: no link download, no page handler.
   const swallow = (e: MouseEvent) => {
@@ -533,7 +616,10 @@ async function start(ctx: ContentScriptContext): Promise<void> {
       if (!state.pickMode || !e.altKey || insideUi(e)) return
       e.preventDefault()
       e.stopImmediatePropagation()
-      if (e.target instanceof Element) openNewPopup(pickTarget(e.target))
+      if (!(e.target instanceof Element)) return
+      // Pick what the outline shows: the block under the cursor, or its widened parent.
+      const base = pickTarget(e.target)
+      openNewPopup(stack[0]?.el === base.el ? stack.at(-1)! : base)
     },
     { capture: true },
   )
@@ -544,15 +630,11 @@ async function start(ctx: ContentScriptContext): Promise<void> {
     if (area !== 'local' || !ctx.isValid) return
     if (KEYS.queue in changes) {
       state.queue = (changes[KEYS.queue]!.newValue as UiEdit[] | undefined) ?? []
+      syncPreviews()
       relocate()
     }
     if (KEYS.link in changes) state.link = (changes[KEYS.link]!.newValue as StoredState['link'] | undefined) ?? { connected: false }
     if (KEYS.collapsed in changes) state.collapsed = !!changes[KEYS.collapsed]!.newValue
-    if (KEYS.lastTell in changes) {
-      state.lastTell = changes[KEYS.lastTell]!.newValue as StoredState['lastTell']
-      clearTimeout(noticeTimer)
-      noticeTimer = setTimeout(renderPanel, NOTICE_MS + 50)
-    }
     if (KEYS.pickMode in changes) {
       state.pickMode = !!changes[KEYS.pickMode]!.newValue
       applyPickMode()

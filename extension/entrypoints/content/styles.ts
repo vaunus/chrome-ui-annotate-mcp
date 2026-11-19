@@ -158,6 +158,8 @@ kbd {
 .link-btn { border: 0; background: none; padding: 0; color: var(--accent); font: inherit; font-size: 12px; cursor: pointer; }
 .link-btn:hover { text-decoration: underline; }
 .panel-foot { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-top: 1px solid var(--line); }
+.apply { flex: 1; min-width: 0; color: var(--muted); font-size: 12px; }
+.apply code { font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--fg); user-select: all; }
 .hint { padding: 0 12px 10px; color: var(--muted); font-size: 11px; }
 
 .btn {
@@ -208,12 +210,8 @@ textarea {
 }
 textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
 .warn { color: #b45309; font-size: 12px; }
+.preview-hint { margin-top: -4px; color: var(--muted); font-size: 11px; }
 .error { color: #dc2626; font-size: 12px; }
 .popup-foot { display: flex; align-items: center; gap: 8px; }
 .popup-foot .keys { margin-right: auto; color: var(--muted); font-size: 11px; }
-
-/* ---- notice (result of Tell Claude) ---------------------------------- */
-.notice { padding: 8px 12px; border-top: 1px solid var(--line); background: var(--soft); font-size: 12px; }
-.notice.error { color: #dc2626; }
-.notice code { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
 `

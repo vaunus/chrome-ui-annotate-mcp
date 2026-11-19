@@ -3,3 +3,4 @@ packages:
   - shared
   - extension
   - playground
+  - e2e

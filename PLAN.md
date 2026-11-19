@@ -1,6 +1,6 @@
 # UI Annotate MCP — v1 Plan
 
-Option+click anything on your local Next.js app. Edit its copy or add a note. Each one goes into a queue in the browser. When you are ready, Claude is told to pull the queue. Claude finds the source, applies each item, and reports back.
+Option+click anything on your local Next.js app. Edit its copy or add a note. Each one goes into a queue in the browser. When you are ready, you run `/ui-annotate:apply` in Claude. Claude pulls the queue, finds the source, applies each item, and reports back.
 
 ## Decisions
 
@@ -9,9 +9,7 @@ Option+click anything on your local Next.js app. Edit its copy or add a note. Ea
 - Two item kinds in v1:
   - **Copy edit:** new text for a text block.
   - **Note:** a free-text note on any element ("make this bigger", "remove this").
-- Claude always pulls with `get_pending_edits`. Two ways to tell Claude to pull, one server:
-  - **VS Code panel:** you tell Claude "apply my UI edits".
-  - **VS Code integrated terminal:** run `claude --dangerously-load-development-channels server:ui-annotate`. Click "Tell Claude" in the browser. The server pushes "N UI edits ready" into the session. Claude pulls on its own.
+- Pull only. You run `/ui-annotate:apply` (or say "apply my UI edits"). Claude calls `get_pending_edits`. No push into the session.
 - Edit in a popup, not inline. Inline edits fight React re-renders and break text with inner links.
 - Build our own. No fork.
 
@@ -28,8 +26,7 @@ Local MCP server (Node, stdio) ◄─────┘
   ├─ WebSocket server    Origin check: chrome-extension://<pinned id>
   ├─ relay               tool call → request to extension → reply (5 s timeout)
   ├─ tools               get_pending_edits, mark_edit_done
-  ├─ prompt              apply  (→ /mcp__ui-annotate__apply, if the panel shows MCP prompts)
-  └─ channel             "Tell Claude" → notifications/claude/channel → "N UI edits ready"
+  └─ prompt              apply  (→ /ui-annotate:apply, also /mcp__ui-annotate__apply)
                                      │ stdio
 Claude Code (VS Code panel or terminal)
 ```
@@ -37,7 +34,7 @@ Claude Code (VS Code panel or terminal)
 ## Pull flow
 
 1. You queue items over time. Each one is `queued`.
-2. You tell Claude: type in the panel, or click "Tell Claude" in push mode.
+2. You run `/ui-annotate:apply` in Claude. The panel shows this command while items are queued.
 3. Claude calls `get_pending_edits`. The server asks the extension. The extension returns all `queued` items and sets them to `working`.
 4. Claude applies each item. It calls `mark_edit_done` for each one.
 5. The extension updates the item: `done`, `failed` or `needs_input`, with Claude's message.
@@ -78,14 +75,9 @@ type UiEdit = {
   - Load `extension/.output/chrome-mv3` unpacked. Check that `Alt+Shift+E` toggles edit mode and the badge shows `ON`.
   - Check that Option+click on a link does not download it.
 - [x] Service worker WebSocket client: auto reconnect, ping every `PING_INTERVAL_MS`, connection dot in the queue panel. Set `onmessage` straight after `new WebSocket()`: the server sends saved results as soon as the extension connects.
-- [x] Full pull flow: queue → tell → pull → apply → status back to panel and markers.
-- [x] Panel-mode hint after "Tell Claude" with no push: "In Claude, type: apply my UI edits".
-- [ ] Push flow from the browser: "Tell Claude" with `claude --dangerously-load-development-channels server:ui-annotate` in the VS Code terminal. Claude should start on its own.
-- [ ] Automate the tests as a script (`pnpm e2e`) with `agent-browser --extension extension/.output/chrome-mv3`:
-  - `extension/scripts/sw-eval.ts` runs code in the service worker over CDP, e.g. to turn edit mode on.
-  - Fake Option+click works: dispatch `MouseEvent('click', { altKey: true, bubbles: true, cancelable: true, composed: true })`.
-  - To load a new build, relaunch the browser. `chrome.runtime.reload()` drops an unpacked extension in the test browser.
-  - The extension always connects to port 7317. Add a build-time port setting for e2e runs, so the test server does not clash with a real Claude session. (In Phase 2 the test browser used this session's server on purpose.)
+- [x] Full pull flow: queue → pull → apply → status back to panel and markers.
+- [x] Panel shows `/ui-annotate:apply in Claude to apply N` while items are queued.
+- [x] Automate the tests: `pnpm e2e` (`e2e/run.ts`). It uses the e2e build (`.output/chrome-mv3-e2e`, port 7399 from `extension/.env.e2e`) and a scripted MCP client in place of Claude. It never touches the extension you have loaded or a real Claude session.
 - [ ] Test app `playground/` (Next 16, App Router, `pnpm --filter playground exec next dev -p 3100`) with these cases:
   - [x] Plain heading text
   - [x] Text with an inner link
@@ -93,16 +85,12 @@ type UiEdit = {
   - [x] Text from an i18n JSON file
   - [x] Repeated text ("Save" in 3 places): Claude asks with `needs_input`, the user fixes it in the popup, and it is queued again
   - [x] Text from a server component
-  - [ ] Text that is not in the repo (must fail cleanly). The playground API route is in the repo, so Claude could edit it. Add a case with text built at run time.
+  - [ ] **You + Claude:** text that is not in the repo must fail cleanly. Test it on "Running on localhost:3100" (`HostNote`: the host comes from `window.location`). Option+click it, change it, then run `/ui-annotate:apply`. Claude should mark it `failed`.
   - [x] Note on an image ("remove this")
   - [x] Queue survives a page reload
-  - [ ] Queue survives a Claude restart
+  - [x] Queue survives a Claude restart
 
-### [ ] Phase 4: v1 polish
-- [ ] Optional live preview of the new text on the page.
-- [ ] `↑` key while picking widens the pick to the parent.
-- [ ] README: install steps, `claude mcp add` command, shell alias for the channel flag.
-- [ ] README: allow `mcp__ui-annotate__get_pending_edits` and `mcp__ui-annotate__mark_edit_done` in the target project's `.claude/settings.json`, so Claude does not ask permission for each edit.
+### [x] Phase 4: v1 polish
 
 ## Post-v1
 
@@ -110,14 +98,7 @@ type UiEdit = {
 - Exact file:line: React 19 `_debugStack` + Next dev source maps, or a build plugin. Client frames point at Turbopack chunk URLs (source maps can resolve them). Server frames point at `about://React/Prerender/file:///…/.next/dev/server/chunks/…`.
 - Area select + screenshot.
 - Many sessions: port range + session picker in the extension.
-- Watch mode for the VS Code panel: a long-poll tool that waits for the next "Tell Claude".
 
-## Install (target)
+## Install
 
-```bash
-claude mcp add --scope user ui-annotate -- node /Users/vaunus/Workspaces/chrome-ui-annotate-mcp/server/src/index.ts
-# push mode, in the VS Code integrated terminal:
-claude --dangerously-load-development-channels server:ui-annotate
-```
-
-Chrome: `chrome://extensions` → Developer mode → Load unpacked → `extension/.output/chrome-mv3`.
+See `README.md`.

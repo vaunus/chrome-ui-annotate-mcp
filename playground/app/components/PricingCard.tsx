@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-// Client component. Three of these render a repeated "Save" button.
+// Client component. Three of these render a repeated "Sign up" button.
 export function PricingCard({ name, price }: { name: string; price: string }) {
   const [saved, setSaved] = useState(false);
   return (
@@ -13,7 +13,7 @@ export function PricingCard({ name, price }: { name: string; price: string }) {
         onClick={() => setSaved(true)}
         className="rounded-lg bg-zinc-900 px-4 py-2 text-white"
       >
-        {saved ? "Saved" : "Save"}
+        {saved ? "Saved" : "Sign up"}
       </button>
     </div>
   );

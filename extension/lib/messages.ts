@@ -9,19 +9,15 @@ export const KEYS = {
   queue: 'queue',
   pickMode: 'pickMode',
   link: 'link',
-  lastTell: 'lastTell',
   collapsed: 'collapsed',
 } as const
 
 export type LinkState = { connected: boolean }
 
-export type TellResult = { at: number; ok: boolean; count: number; error?: string }
-
 export type StoredState = {
   queue: UiEdit[]
   pickMode: boolean
   link: LinkState
-  lastTell?: TellResult
   collapsed: boolean
 }
 
@@ -31,7 +27,6 @@ export type BgRequest =
   | { type: 'remove'; id: string }
   | { type: 'reset'; id: string }
   | { type: 'clear_done' }
-  | { type: 'tell_claude' }
   | { type: 'toggle_pick' }
   | { type: 'set_collapsed'; collapsed: boolean }
   /** Keeps the service worker awake so it can reconnect to Claude quickly. */

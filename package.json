@@ -7,9 +7,11 @@
     "node": ">=24"
   },
   "scripts": {
+    "dev": "pnpm --filter playground exec next dev -p 3100",
     "typecheck": "tsc -p tsconfig.json && tsc -p extension/tsconfig.json",
     "test": "pnpm -r --filter ./server --filter ./extension test",
-    "build": "pnpm --filter @ui-annotate/extension build"
+    "build": "pnpm --filter @ui-annotate/extension build",
+    "e2e": "pnpm --filter @ui-annotate/extension build:e2e && node e2e/run.ts"
   },
   "devDependencies": {
     "@types/node": "^24.19.2",

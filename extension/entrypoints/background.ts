@@ -2,7 +2,7 @@
 // link to the MCP server that Claude Code runs.
 
 import { DEFAULT_PORT, PING_INTERVAL_MS, type ExtensionMessage, type ServerMessage, type UiEdit } from '@ui-annotate/shared'
-import { KEYS, type BgRequest, type BgResponse, type LinkState, type TellResult } from '../lib/messages.ts'
+import { KEYS, type BgRequest, type BgResponse, type LinkState } from '../lib/messages.ts'
 import {
   addEdit,
   clearDone,
@@ -15,7 +15,10 @@ import {
   type Change,
 } from '../lib/queue.ts'
 
-const SERVER_URL = `ws://127.0.0.1:${DEFAULT_PORT}`
+// The e2e build (`wxt build --mode e2e`, see .env.e2e) uses its own port, so a
+// test run never takes the link from a real Claude session.
+const PORT = Number(import.meta.env.WXT_UI_ANNOTATE_PORT) || DEFAULT_PORT
+const SERVER_URL = `ws://127.0.0.1:${PORT}`
 const RETRY_MS = 2000
 const RECONNECT_ALARM = 'reconnect'
 
@@ -33,11 +36,6 @@ export default defineBackground(() => {
     })
     chain = run.catch(() => {})
     return run
-  }
-
-  async function readQueue(): Promise<UiEdit[]> {
-    const got = await browser.storage.local.get(KEYS.queue)
-    return (got[KEYS.queue] as UiEdit[] | undefined) ?? []
   }
 
   // ---- link to the MCP server ---------------------------------------------
@@ -73,17 +71,6 @@ export default defineBackground(() => {
     if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify(msg))
   }
 
-  /** Wait briefly for the link, e.g. when the user clicks Tell Claude right after starting Claude. */
-  async function linked(timeoutMs = 1500): Promise<WebSocket | null> {
-    connect()
-    const end = Date.now() + timeoutMs
-    while (Date.now() < end) {
-      if (ws?.readyState === WebSocket.OPEN) return ws
-      await new Promise((r) => setTimeout(r, 50))
-    }
-    return ws?.readyState === WebSocket.OPEN ? ws : null
-  }
-
   async function handleServer(sock: WebSocket, raw: string): Promise<void> {
     let msg: ServerMessage
     try {
@@ -105,23 +92,6 @@ export default defineBackground(() => {
     } catch (err) {
       send(sock, { type: 'reply', id, ok: false, error: (err as Error).message })
     }
-  }
-
-  // ---- Tell Claude -----------------------------------------------------------
-
-  async function tellClaude(): Promise<TellResult> {
-    const count = queuedCount(await readQueue())
-    let result: TellResult
-    if (count === 0) {
-      result = { at: Date.now(), ok: false, count, error: 'Nothing is queued.' }
-    } else {
-      const sock = await linked()
-      result = sock
-        ? (send(sock, { type: 'tell_claude', count }), { at: Date.now(), ok: true, count })
-        : { at: Date.now(), ok: false, count, error: 'Claude is not connected. Start Claude Code in your project, then try again.' }
-    }
-    await browser.storage.local.set({ [KEYS.lastTell]: result })
-    return result
   }
 
   // ---- edit mode and badge ---------------------------------------------------
@@ -156,8 +126,6 @@ export default defineBackground(() => {
           return mutate((q) => resetEdit(q, req.id))
         case 'clear_done':
           return mutate(clearDone)
-        case 'tell_claude':
-          return tellClaude()
         case 'toggle_pick':
           return togglePick()
         case 'set_collapsed':
@@ -176,7 +144,6 @@ export default defineBackground(() => {
 
   browser.commands.onCommand.addListener((command) => {
     if (command === 'toggle-pick') void togglePick()
-    if (command === 'tell-claude') void tellClaude()
   })
 
   browser.action.onClicked.addListener(() => void togglePick())

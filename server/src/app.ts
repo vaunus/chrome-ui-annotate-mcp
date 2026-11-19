@@ -1,4 +1,4 @@
-// MCP server for UI Annotate: tools, the `apply` prompt, and the channel push.
+// MCP server for UI Annotate: the tools and the `apply` prompt.
 // The browser owns the queue. This server only relays between Claude and the extension.
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -17,7 +17,7 @@ export const INSTRUCTIONS = `This server links you to the UI Annotate Chrome ext
 - copy: new text for a text block.
 - note: a request about one element, like "make this bigger" or "remove this".
 
-Pull them with get_pending_edits when the user asks you to apply UI edits, or when a <channel source="ui-annotate"> event says edits are ready. Call it once per request.
+Pull them with get_pending_edits when the user asks you to apply UI edits. Call it once per request.
 
 For each edit:
 1. Find the source. For copy edits, search the code for a distinctive part of the old text. JSX can split text over lines, use entities ({"'"}, &apos;) or wrap words in tags. Text can also live in i18n JSON or constants.
@@ -71,9 +71,13 @@ export type AppOptions = {
   log?: (msg: string) => void
   requestTimeoutMs?: number
   retryMs?: number
+  connectWaitMs?: number
+  yieldMs?: number
 }
 
 const text = (t: string, isError = false): CallToolResult => ({ content: [{ type: 'text', text: t }], isError })
+
+const TOOK_OVER = 'Took over the browser link from another Claude session.\n\n'
 
 export function createApp(options: AppOptions) {
   const log = options.log ?? (() => {})
@@ -86,7 +90,6 @@ export function createApp(options: AppOptions) {
     { name: 'ui-annotate', version: '0.1.0' },
     {
       capabilities: {
-        experimental: { 'claude/channel': {} },
         tools: {},
         prompts: {},
       },
@@ -99,25 +102,11 @@ export function createApp(options: AppOptions) {
     allowedOrigins: options.allowedOrigins,
     requestTimeoutMs: options.requestTimeoutMs,
     retryMs: options.retryMs,
+    connectWaitMs: options.connectWaitMs,
+    yieldMs: options.yieldMs,
     log,
-    onTellClaude: (count) => void pushReady(count),
     onConnected: () => void flushUnsent(),
   })
-
-  async function pushReady(count: number): Promise<void> {
-    if (count <= 0) return
-    try {
-      await mcp.notification({
-        method: 'notifications/claude/channel',
-        params: {
-          content: `${count} UI edit${count === 1 ? '' : 's'} ready in the browser. Call get_pending_edits to pull them.`,
-          meta: { count: String(count) },
-        },
-      })
-    } catch (err) {
-      log(`channel push failed: ${(err as Error).message}`)
-    }
-  }
 
   async function flushUnsent(): Promise<void> {
     for (const result of [...unsent.values()]) {
@@ -132,11 +121,13 @@ export function createApp(options: AppOptions) {
   }
 
   async function getPendingEdits(): Promise<CallToolResult> {
+    let note = ''
     try {
+      if ((await bridge.ready()).tookOver) note = TOOK_OVER
       const edits = await bridge.request('get_pending_edits')
-      return text(formatEdits(edits))
+      return text(note + formatEdits(edits))
     } catch (err) {
-      return text((err as Error).message, true)
+      return text(note + (err as Error).message, true)
     }
   }
 
@@ -149,9 +140,11 @@ export function createApp(options: AppOptions) {
     if (status !== 'done' && !message) return text(`message is required when status is ${status}. Say why.`, true)
 
     const result: EditResult = { id, status, ...(message ? { message } : {}) }
+    let note = ''
     try {
+      if ((await bridge.ready()).tookOver) note = TOOK_OVER
       await bridge.request('mark_edit_done', result)
-      return text(`Marked ${id} as ${status}.`)
+      return text(`${note}Marked ${id} as ${status}.`)
     } catch (err) {
       if (err instanceof BridgeError && err.code === 'remote_error') return text(err.message, true)
       unsent.set(id, result)

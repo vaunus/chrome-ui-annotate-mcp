@@ -18,23 +18,6 @@ function startServer() {
   return { child, out: () => stdout, err: () => stderr }
 }
 
-test('never picks protocol 2026-07-28, which drops channel messages', async () => {
-  const s = startServer()
-  s.child.stdin.write(
-    JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'initialize',
-      params: { protocolVersion: '2026-07-28', capabilities: {}, clientInfo: { name: 't', version: '0' } },
-    }) + '\n',
-  )
-  await waitFor(() => s.out().includes('"id":1'), 5000)
-  const reply = JSON.parse(s.out().split('\n')[0]!)
-  assert.notEqual(reply.result.protocolVersion, '2026-07-28')
-  assert.deepEqual(reply.result.capabilities.experimental, { 'claude/channel': {} })
-  s.child.kill()
-})
-
 test('end to end over stdio with the pinned extension origin', async () => {
   const s = startServer()
   const rpc = (msg: object) => s.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', ...msg }) + '\n')
@@ -49,10 +32,6 @@ test('end to end over stdio with the pinned extension origin', async () => {
     rpc({ id: 2, method: 'tools/call', params: { name: 'get_pending_edits', arguments: {} } })
     await waitFor(() => s.out().includes('"id":2'), 5000)
     assert.match(s.out(), /1 UI edit from the browser/)
-
-    ext.send({ type: 'tell_claude', count: 1 })
-    await waitFor(() => s.out().includes('notifications/claude/channel'), 5000)
-    assert.match(s.out(), /1 UI edit ready in the browser/)
     await ext.close()
   } finally {
     s.child.kill()

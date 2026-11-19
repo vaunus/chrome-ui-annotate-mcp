@@ -6,7 +6,7 @@ export function Hero() {
         New for teams
       </p>
       <h1 className="text-4xl font-bold tracking-tight">
-        Ship your landing page in a weekend
+        Ship your landing page in a day
       </h1>
       <p className="max-w-xl text-lg text-zinc-600">
         Pick a plan that fits your team. Read the{" "}

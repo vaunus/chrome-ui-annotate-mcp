@@ -20,18 +20,39 @@ function hasDirectText(el: Element): boolean {
   return false
 }
 
+/** A text block by the pick rule: a text tag, or a block element with its own text. */
+function isTextBlock(el: Element): boolean {
+  if (!collapse(el.textContent)) return false
+  return TEXT_TAGS.has(el.tagName) || (hasDirectText(el) && BLOCKISH.has(getComputedStyle(el).display))
+}
+
+const isTop = (el: Element | null) => !el || el === document.body || el === document.documentElement
+
 /** The block a click on `start` picks. The hover outline uses the same rule. */
 export function pickTarget(start: Element): Pick {
   const media = start.closest('svg') ?? start
   if (MEDIA_TAGS.has(media.tagName.toUpperCase())) return { el: media, hasText: false }
-
-  for (let cur: Element | null = start; cur && cur !== document.body && cur !== document.documentElement; cur = cur.parentElement) {
-    const text = collapse(cur.textContent)
-    if (!text) continue
-    if (TEXT_TAGS.has(cur.tagName)) return { el: cur, hasText: true }
-    if (hasDirectText(cur) && BLOCKISH.has(getComputedStyle(cur).display)) return { el: cur, hasText: true }
+  for (let cur: Element | null = start; !isTop(cur); cur = cur!.parentElement) {
+    if (isTextBlock(cur!)) return { el: cur!, hasText: true }
   }
   return { el: start, hasText: false }
+}
+
+/** ↑ while picking: the next parent with its own box (wrappers of the same size are skipped). */
+export function widen(el: Element): Pick | null {
+  const r = el.getBoundingClientRect()
+  for (let cur = el.parentElement; !isTop(cur); cur = cur!.parentElement) {
+    const c = cur!.getBoundingClientRect()
+    if (c.left === r.left && c.top === r.top && c.width === r.width && c.height === r.height) continue
+    return { el: cur!, hasText: isTextBlock(cur!) }
+  }
+  return null
+}
+
+/** The element's only child, when that is a text node. Live preview edits it in place. */
+export function soleTextNode(el: Element): Text | null {
+  const only = el.childNodes.length === 1 ? el.firstChild : null
+  return only?.nodeType === Node.TEXT_NODE ? (only as Text) : null
 }
 
 /** Ids React makes up (useId) or UI kits generate change between renders, so skip them. */

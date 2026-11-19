@@ -2,13 +2,11 @@ import { afterEach, beforeEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
-import type { Notification } from '@modelcontextprotocol/sdk/types.js'
 import { createApp } from '../src/app.ts'
 import { FakeExtension, makeEdit, ORIGIN, waitFor } from './helpers.ts'
 
 let app: ReturnType<typeof createApp>
 let client: Client
-let notifications: Notification[]
 let exts: FakeExtension[]
 
 beforeEach(async () => {
@@ -18,8 +16,6 @@ beforeEach(async () => {
   app.start()
   await waitFor(() => app.bridge.state === 'listening')
   client = new Client({ name: 'test', version: '0' })
-  notifications = []
-  client.fallbackNotificationHandler = async (n) => void notifications.push(n)
   await client.connect(clientSide)
   exts = []
 })
@@ -40,8 +36,7 @@ async function openExt(): Promise<FakeExtension> {
 const textOf = (res: Awaited<ReturnType<Client['callTool']>>) =>
   (res.content as Array<{ type: string; text: string }>).map((c) => c.text).join('\n')
 
-test('declares the channel capability and instructions', () => {
-  assert.deepEqual(client.getServerCapabilities()?.experimental?.['claude/channel'], {})
+test('declares the instructions', () => {
   assert.match(client.getInstructions() ?? '', /get_pending_edits/)
   assert.match(client.getInstructions() ?? '', /mark_edit_done/)
 })
@@ -113,16 +108,27 @@ test('mark_edit_done while the browser is away is sent on reconnect', async () =
   assert.equal(ext.requests[0]?.method, 'mark_edit_done')
 })
 
-test('tell_claude pushes a channel event into the session', async () => {
-  const ext = await openExt()
-  ext.send({ type: 'tell_claude', count: 3 })
-  await waitFor(() => notifications.length === 1)
-  const { method, params } = notifications[0]!
-  assert.deepEqual({ method, params }, {
-    method: 'notifications/claude/channel',
-    params: {
-      content: '3 UI edits ready in the browser. Call get_pending_edits to pull them.',
-      meta: { count: '3' },
-    },
-  })
+test('a tool in a waiting session takes over the link and says so', async () => {
+  const second = createApp({ port: app.bridge.port, allowedOrigins: [ORIGIN], requestTimeoutMs: 300, retryMs: 50, connectWaitMs: 3000, yieldMs: 300 })
+  const [c2, s2] = InMemoryTransport.createLinkedPair()
+  await second.mcp.connect(s2)
+  second.start()
+  await waitFor(() => second.bridge.state === 'port_busy')
+  const client2 = new Client({ name: 'test2', version: '0' })
+  await client2.connect(c2)
+  try {
+    const call = client2.callTool({ name: 'get_pending_edits', arguments: {} })
+    await waitFor(() => second.bridge.state === 'listening')
+    const ext = await FakeExtension.open(second.bridge.port)
+    exts.push(ext)
+    ext.handler = () => ({ ok: true, result: [makeEdit()] })
+    const res = await call
+    assert.equal(res.isError, false)
+    assert.match(textOf(res), /^Took over the browser link from another Claude session\./)
+    assert.match(textOf(res), /1 UI edit from the browser/)
+    assert.equal(app.bridge.state, 'port_busy')
+  } finally {
+    await client2.close()
+    await second.close()
+  }
 })

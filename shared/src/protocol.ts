@@ -28,8 +28,6 @@ export type ServerMessage = ServerRequest | { type: 'pong' }
 export type ExtensionMessage =
   | { type: 'reply'; id: string; ok: true; result: unknown }
   | { type: 'reply'; id: string; ok: false; error: string }
-  /** The user clicked "Tell Claude". The server pushes a channel event. */
-  | { type: 'tell_claude'; count: number }
   | { type: 'ping' }
 
 export type RequestResult = {

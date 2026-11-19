@@ -114,15 +114,6 @@ test('answers ping with pong', async () => {
   await waitFor(() => ext.messages.some((m) => m.type === 'pong'))
 })
 
-test('tell_claude calls onTellClaude with the count', async () => {
-  const counts: number[] = []
-  const bridge = await startBridge({ onTellClaude: (n) => counts.push(n) })
-  const ext = await openExt(bridge.port)
-  ext.send({ type: 'tell_claude', count: 3 })
-  await waitFor(() => counts.length === 1)
-  assert.deepEqual(counts, [3])
-})
-
 test('a new extension connection replaces the old one', async () => {
   const bridge = await startBridge()
   const first = await openExt(bridge.port)
@@ -150,4 +141,82 @@ test('port busy: says so, then takes over when the owner quits', async () => {
   await owner.close()
   await waitFor(() => waiting.state === 'listening')
   assert.equal(waiting.port, port)
+})
+
+// ---- takeover ---------------------------------------------------------------------
+
+import { createServer, request as httpRequest } from 'node:http'
+
+function post(port: number, headers: Record<string, string>): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest({ host: '127.0.0.1', port, path: '/handover', method: 'POST', headers }, (res) => {
+      res.resume()
+      resolve(res.statusCode ?? 0)
+    })
+    req.on('error', reject)
+    req.end()
+  })
+}
+
+/** A fixed free port. Port 0 would let a bridge that retries bind a new random port. */
+async function freePort(): Promise<number> {
+  const s = createServer()
+  await new Promise<void>((r) => s.listen(0, '127.0.0.1', () => r()))
+  const { port } = s.address() as { port: number }
+  await new Promise((r) => s.close(r))
+  return port
+}
+
+test('takeover: the waiting session takes the link, the old owner lets go and waits', async () => {
+  const port = await freePort()
+  const owner = await startBridge({ port, retryMs: 50, yieldMs: 300 })
+  const oldExt = await openExt(port)
+  let oldClosed = false
+  oldExt.ws.on('close', () => (oldClosed = true))
+  const waiting = await startBridge({ port, retryMs: 50, connectWaitMs: 3000 })
+  assert.equal(waiting.state, 'port_busy')
+
+  // The extension reconnects to whoever holds the port, as the real one does.
+  const ready = waiting.ready()
+  await waitFor(() => waiting.state === 'listening')
+  const ext = await openExt(port)
+  ext.handler = () => ({ ok: true, result: [] })
+  assert.deepEqual(await ready, { tookOver: true })
+  assert.deepEqual(await waiting.request('get_pending_edits'), [])
+
+  await waitFor(() => oldClosed)
+  assert.equal(owner.state, 'port_busy')
+  // Past its yield time, the old owner still waits: it does not grab the port back.
+  await new Promise((r) => setTimeout(r, 500))
+  assert.equal(owner.state, 'port_busy')
+  assert.equal(waiting.state, 'listening')
+
+  // When the new owner quits, the old one takes the port again.
+  await waiting.close()
+  await waitFor(() => owner.state === 'listening')
+})
+
+test('ready() is a no-op for the owner', async () => {
+  const bridge = await startBridge()
+  assert.deepEqual(await bridge.ready(), { tookOver: false })
+})
+
+test('handover refuses browser requests and requests without the header', async () => {
+  const owner = await startBridge()
+  assert.equal(await post(owner.port, {}), 403)
+  assert.equal(await post(owner.port, { 'x-ui-annotate': 'handover', origin: 'http://evil.example' }), 403)
+  assert.equal(owner.state, 'listening')
+})
+
+test('takeover fails cleanly when another program holds the port', async () => {
+  const other = createServer((_req, res) => res.writeHead(404).end())
+  await new Promise<void>((r) => other.listen(0, '127.0.0.1', () => r()))
+  open.push({ close: () => new Promise((r) => other.close(r)) })
+  const port = (other.address() as { port: number }).port
+  const waiting = await startBridge({ port, retryMs: 50 })
+  await assert.rejects(waiting.ready(), (err) => {
+    assert.equal(codeOf(err), 'port_busy')
+    assert.match((err as Error).message, /did not hand it over/)
+    return true
+  })
 })
