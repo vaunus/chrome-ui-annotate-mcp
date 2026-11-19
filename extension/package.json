@@ -1,0 +1,18 @@
+{
+  "name": "@ui-annotate/extension",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "wxt build",
+    "dev": "wxt",
+    "prepare": "wxt prepare",
+    "test": "node --test 'test/**/*.test.ts'"
+  },
+  "dependencies": {
+    "@ui-annotate/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "wxt": "^0.21.5"
+  }
+}

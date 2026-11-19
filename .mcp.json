@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ui-annotate": {
+      "command": "node",
+      "args": ["server/src/index.ts"]
+    }
+  }
+}
